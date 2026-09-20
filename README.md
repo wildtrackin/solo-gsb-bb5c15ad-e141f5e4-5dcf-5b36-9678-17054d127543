@@ -1,6 +1,6 @@
 # 配置变更三方合并 API
 
-基于 **Python + FastAPI + SQLite** 的配置三方合并服务。客户端提交 `base`（共同祖先）、`left`、`right` 三份 JSON，服务按 JSON Pointer 递归合并对象：单侧修改自动采用、双侧同值修改自动合并、双侧不同修改在冲突处保留占位符并返回双方候选。客户端携带当前 `revision` 分批提交冲突取值，全部解决后生成**不可变**结果。
+基于 **Python + FastAPI + SQLite** 的配置三方合并服务。客户端提交 `base`（共同祖先）、`left`、`right` 三份 JSON，服务按 JSON Pointer 递归合并对象：单侧修改自动采用、双侧同值修改自动合并、双侧不同修改在冲突处保留占位符并返回双方候选。客户端携带当前 `revision` 分批提交冲突取值（也支持规则批量裁决、历史合并单复用与持久化草案），全部解决后生成**不可变**结果；在合并单仍为 `pending` 时，还可基于初始快照重放**撤销上一批裁决**。
 
 ## 快速启动（单条命令）
 
@@ -46,6 +46,7 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `POST` | `/merges/{merge_id}/resolution-preview` | 预演冲突解决：内存副本上校验并应用，不落库、不改状态 |
 | `POST` | `/merges/{merge_id}/rule-resolutions` | 携带 revision 与有序路径规则，按模式批量裁决冲突（最后一批须通过门禁） |
 | `POST` | `/merges/{merge_id}/reuse-resolutions` | 从一个已 resolved 的历史合并单按指针复用裁决，原子应用全部匹配项 |
+| `POST` | `/merges/{merge_id}/resolution-undo` | 撤销最近一批仍生效的裁决：从初始快照重放重建，revision +1 |
 | `POST` | `/merges/{merge_id}/drafts` | 为待处理合并单创建解决草案（固定创建时的 revision） |
 | `GET` | `/merges/{merge_id}/drafts/{draft_id}` | 查看草案：状态、钉住的 base_revision、已累积的取值 |
 | `POST` | `/merges/{merge_id}/drafts/{draft_id}/resolutions` | 向草案追加或覆盖冲突取值（只改草案，不改合并单） |
@@ -348,7 +349,57 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/ru
 - **revision 过期 / 目标已 `resolved` → `409`**（过期时携带 `current_revision`）；目标合并单不存在 → `404`。
 - **来源不合法 → `400`**：来源合并单不存在、尚为 `pending`（未产生最终结果）、缺少冲突快照（早于快照功能的历史数据），均返回 `400` 且目标不发生任何变化。
 
-### 7. 持久化解决草案 — `/merges/{merge_id}/drafts`
+### 7. 撤销上一批裁决 — `POST /merges/{merge_id}/resolution-undo`
+
+一批裁决提交后若想反悔（取值选错、批量规则误伤、复用了不合适的历史结果），可对**仍为 `pending`** 的合并单携带当前 `revision` 撤销**最近一条仍生效的裁决事件**：该批涉及的全部指针重新成为开放冲突，工作文档回到该批应用之前的状态，`revision` **+1**。
+
+撤销的实现方式是**重放重建，而不是反向修改当前 JSON**：
+
+1. 从合并单**不可变的初始冲突快照**（创建时的工作文档与初始冲突列表）出发；
+2. 按 `seq` 顺序重放审计链中的裁决事件（`resolutions` / `rule-resolutions` / `reuse-resolutions` / `draft-commit`），每条事件都自带该批的全部指针与裁决内容，可直接还原为对初始冲突的取值；
+3. **跳过**已经被撤销补偿的裁决事件以及撤销事件本身——当前要撤销的目标事件同样跳过；
+4. 重放得到的文档与开放冲突即为撤销后的状态，整体替换工作文档（删除语义、显式 `null`、规则选侧、复用取值/删除都随重放原样恢复）。
+
+```bash
+curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/resolution-undo \
+  -H 'Content-Type: application/json' \
+  -d '{"revision": 2}'
+```
+
+响应（普通状态视图之外，额外说明被撤事件与恢复的指针）：
+
+```json
+{
+  "merge_id": "bc6d2c3d9a3343bf9177147a10ec4023",
+  "status": "pending",
+  "revision": 3,
+  "document": {
+    "replicas": 3,
+    "db": {"host": {"__merge_conflict__": "/db/host"}, "port": 5433}
+  },
+  "conflicts": [
+    {"pointer": "/db/host", "base": "a", "left": "b", "right": "c", "missing": []}
+  ],
+  "conflict_count": 1,
+  "result": null,
+  "undone_seq": 1,
+  "undone_method": "resolutions",
+  "restored_pointers": ["/db/host"],
+  "restored_count": 1,
+  "created_at": "...", "updated_at": "..."
+}
+```
+
+- **一次只撤销一条**：即当前最近一条**未被补偿**的有效裁决事件。撤销成功后该事件不会从审计链中删除，而是由新追加的 `resolution-undo` 事件在 `detail.undone_seq` 中记录被补偿事件的序号（并在 `detail.restored_pointers` / 顶层 `restored_pointers` 中列出恢复的指针）；**再次撤销会自动跳过已补偿事件及其撤销事件**，继续回退更早的批次。所有事件仍在同一条哈希链上，链始终可验证。
+- **撤销后可重新裁决**：恢复的冲突可以用任意方式（显式取值 / 规则 / 复用 / 草案）重新解决，新事件正常追加；`revision` 只增不减，事件序号连续追加，不做物理删除。
+- **已 `resolved` 的合并单不可撤销**：最终结果一旦生成即不可变，对其撤销返回 **`409`**；这也意味着“最后一批把冲突全部解决”的裁决无法撤销——结果已锁定。
+- **没有可撤销的裁决**（从未成功裁决过，或所有有效裁决都已被撤销）→ **`409`**（`no effective adjudication to undo`），不写状态、不追加事件。
+- **`revision` 过期 → `409`**（响应体携带 `current_revision`）；合并单不存在 → **`404`**。
+- **失败全程无副作用**：任何 `404` / `409` 都在写入前返回，合并单状态、`revision`、文档、冲突与审计链均保持原样，不留撤销事件。若审计链本身校验不通过（事件被外部篡改或删除，`GET .../audit` 的 `chain_valid` 为 `false`），撤销拒绝执行并返回 **`500`**（重放所依赖的历史已不可信），同样整体回滚、不写状态、不留事件。
+- 撤销本身不受 `result_schema` 门禁影响（它不产生最终结果，且合并单必然仍有开放冲突）。
+- 撤销会推进 `revision`，因此创建时钉住旧 `revision` 的草案在撤销后提交将正常得到 **`409`**（草案内容保留，可新建草案继续编辑）。
+
+### 8. 持久化解决草案 — `/merges/{merge_id}/drafts`
 
 逐条提交 `resolutions` 要求每批都携带最新 revision，适合在线一次性解决。若取值需要跨请求逐步收集（多人协作、审批流、离线试算），可以为 `pending` 合并单创建**解决草案**：草案**固定创建时的 merge revision**（`base_revision`），并快照当时的工作文档与开放冲突；之后的编辑只写草案，**不改合并单**。
 
@@ -392,7 +443,7 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/dr
 - **部分草案也可提交**：未覆盖的冲突原样保留，合并单继续 `pending`（与分批 resolutions 语义一致）；空草案（无任何取值）提交 → `400`。
 - 合并单已 `resolved` → 创建草案与提交草案均 `409`；合并单或草案不存在 → `404`（草案不能跨合并单 URL 访问）。
 
-### 8. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
+### 9. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
 
 合并单 `resolved` 后，可获取从**原始 `base_doc` 到最终 `result`** 的确定性操作序列（[RFC 6902 JSON Patch](https://www.rfc-editor.org/rfc/rfc6902)，路径为 [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)）：
 
@@ -436,19 +487,19 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
 - 合并单不存在 → **`404`**。
 - 无冲突、创建即 `resolved` 的合并单可立即获取补丁（无变化时 `patch` 为 `[]`）。
 
-### 9. 裁决审计链 — `GET /merges/{merge_id}/audit`
+### 10. 裁决审计链 — `GET /merges/{merge_id}/audit`
 
-每一次**成功改变合并单**的裁决请求——`resolutions`、`rule-resolutions`、`reuse-resolutions` 或草案 `commit`——都会在**与合并单更新相同的 SQLite 事务**内追加一条审计事件：事件与状态变更同事务提交或回滚，因此失败请求（`400` / `409` / `422`）、预演接口、草案编辑，以及零命中的规则裁决 / 历史复用（`applied: false`）都**不会留下任何事件**。
+每一次**成功改变合并单**的裁决请求——`resolutions`、`rule-resolutions`、`reuse-resolutions`、草案 `commit`，或一次成功的 `resolution-undo`——都会在**与合并单更新相同的 SQLite 事务**内追加一条审计事件：事件与状态变更同事务提交或回滚，因此失败请求（`400` / `409` / `422`）、预演接口、草案编辑，以及零命中的规则裁决 / 历史复用（`applied: false`）、无可撤销批次的撤销请求都**不会留下任何事件**。
 
 每条事件记录：
 
 | 字段 | 说明 |
 | --- | --- |
 | `seq` | 合并单内单调递增的事件序号（从 1 开始） |
-| `method` | 裁决方式：`resolutions` / `rule-resolutions` / `reuse-resolutions` / `draft-commit` |
-| `revision_before` / `revision_after` | 事件前后的 merge revision |
-| `pointers` | 实际生效的 JSON Pointer（按应用顺序） |
-| `detail` | 方式相关的裁决明细（逐指针的 choice/value 或 side/rule_index、复用来源 `source_merge_id`、草案 `draft_id`） |
+| `method` | 裁决方式：`resolutions` / `rule-resolutions` / `reuse-resolutions` / `draft-commit` / `resolution-undo` |
+| `revision_before` / `revision_after` | 事件前后的 merge revision（撤销同样 +1，revision 永不回退） |
+| `pointers` | 实际生效（撤销时为**恢复**）的 JSON Pointer（按应用顺序） |
+| `detail` | 方式相关的裁决明细（逐指针的 choice/value 或 side/rule_index、复用来源 `source_merge_id`、草案 `draft_id`；撤销事件给出被补偿事件序号 `undone_seq`、`undone_method` 与 `restored_pointers`） |
 | `prev_hash` / `hash` | SHA-256 链：见下 |
 | `created_at` | 事件时间（UTC ISO 8601） |
 | `valid` | 本次链校验中该事件是否通过 |
@@ -499,6 +550,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/audit
 ```
 
 - 从未成功裁决过的合并单返回空链：`events: []`、`chain_valid: true`。
+- **撤销不会删除或改写历史事件**：`resolution-undo` 是链上的普通追加事件，其 `prev_hash` 衔接上一事件，`hash` 按相同规则计算；被它补偿的裁决事件原样保留，因此“裁决 → 撤销 → 重新裁决 → 再撤销”的链条依然连续且整体可验证。
 - 合并单不存在 → **`404`**。
 - 既有接口的响应体不因审计模块增加任何字段，完全保持兼容。
 
@@ -508,7 +560,7 @@ curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/audit
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（140 项）
+python -m pytest tests/ -q                  # 运行测试（167 项）
 ```
 
 ## 项目结构
@@ -519,13 +571,14 @@ app/
   merge.py      # 纯 Python 三方合并引擎（JSON Pointer 递归）
   rules.py      # RFC 6901 风格路径模式（* 与 **）：规则编译、匹配、批量裁决
   reuse.py      # 历史裁决复用：指针 + base/left/right/missing 规范化匹配、来源结果取值/删除
+  undo.py       # 撤销上一批裁决：初始快照 + 审计事件重放重建文档与开放冲突
   patch.py      # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
   validation.py # Draft 2020-12 结果门禁：元 schema 校验 + 最终结果校验（422 错误排序）
   audit.py      # 裁决审计：同事务事件追加 + 逐合并单 SHA-256 哈希链校验
-  store.py      # 合并单状态机 + 解决草案 + 历史复用：revision 校验、冲突解决、不可变结果、schema 门禁
-  db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移与单事务提交支持）
-  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用请求）
-tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用与审计链测试）
+  store.py      # 合并单状态机 + 解决草案 + 历史复用 + 撤销：revision 校验、冲突解决、不可变结果、schema 门禁
+  db.py         # SQLite 连接与建表（启动时执行，含轻量列迁移、审计表 CHECK 扩展与单事务提交支持）
+  models.py     # Pydantic 请求模型（含可选 result_schema、草案编辑、历史复用、撤销请求）
+tests/          # 合并引擎/补丁单测 + API 端到端测试（含 schema 门禁、草案、历史复用、审计链与撤销重放测试）
 Dockerfile
 docker-compose.yml
 requirements.txt

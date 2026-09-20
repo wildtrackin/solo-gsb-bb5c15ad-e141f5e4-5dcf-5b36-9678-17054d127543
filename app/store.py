@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import audit, db, rules
+from . import audit, db, rules, undo
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 from .patch import generate_patch, sha256_hex
 from .reuse import (
@@ -75,6 +75,14 @@ class DraftConflictSetChanged(Exception):
 
 class SourceMergeInvalid(Exception):
     """The source merge of a reuse request cannot provide resolutions."""
+
+
+class NothingToUndo(Exception):
+    """No effective (non-compensated) adjudication event exists to undo."""
+
+
+class AuditChainBroken(Exception):
+    """The merge's audit chain does not verify; rebuilding it is unsafe."""
 
 
 def _now() -> str:
@@ -182,9 +190,10 @@ def create_merge(
             INSERT INTO merges (
                 id, idempotency_key, status, revision,
                 base_doc, left_doc, right_doc,
-                document, conflicts, source_conflicts, result, result_schema,
+                document, conflicts, source_conflicts, initial_document,
+                result, result_schema,
                 created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 merge_id,
@@ -200,6 +209,10 @@ def create_merge(
                 # resolutions shrink ``conflicts`` but reuse matching needs
                 # the original base/left/right/missing of every conflict.
                 json.dumps(conflicts),
+                # Immutable initial working document: resolution undo
+                # replays audit events from this snapshot instead of
+                # reverse-editing the current document.
+                json.dumps(document),
                 json.dumps(result) if result is not None else None,
                 json.dumps(result_schema) if result_schema is not None else None,
                 now,
@@ -846,4 +859,99 @@ def commit_draft(merge_id: str, draft_id: str) -> dict:
         )
     view = get_merge(merge_id)
     view["draft_id"] = draft_id
+    return view
+
+
+# ---------------------------------------------------------------------------
+# Undo of the last effective adjudication batch
+# ---------------------------------------------------------------------------
+
+
+def undo_last_resolution(merge_id: str, expected_revision: int) -> dict:
+    """Undo exactly the most recent still-effective adjudication event.
+
+    The merge must be pending and the supplied revision current. The
+    document and open conflicts are never reverse-edited: they are rebuilt
+    from the immutable initial conflict snapshot by replaying the audit
+    history with the target event (and every already compensated event)
+    skipped. On success the merge row is replaced with the rebuilt state,
+    the revision is bumped by one, and a ``resolution-undo`` event is
+    appended in the same transaction; its detail names the compensated
+    event's sequence number and the restored pointers. A later undo skips
+    compensated events automatically, and the hash chain stays verifiable.
+
+    Raises StaleRevision (409) for an outdated revision, AlreadyResolved
+    (409) for a resolved (immutable) merge and NothingToUndo (409) when no
+    effective adjudication remains. Any failure rolls the whole request
+    back: no state change and no audit event.
+    """
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        if row is None:
+            raise MergeNotFound(merge_id)
+        if row["status"] == STATUS_RESOLVED:
+            raise AlreadyResolved(merge_id)
+        if row["revision"] != expected_revision:
+            raise StaleRevision(row["revision"])
+
+        events = conn.execute(
+            "SELECT * FROM merge_audit_events WHERE merge_id = ? ORDER BY seq ASC",
+            (merge_id,),
+        ).fetchall()
+        # Fail closed: the rebuilt state is only as trustworthy as the
+        # history it is replayed from. A tampered or gapped chain makes the
+        # recorded decisions unverifiable, so no state is rewritten and no
+        # undo event is appended; the exception rolls the transaction back.
+        if not audit.verify_chain(conn, merge_id):
+            raise AuditChainBroken(merge_id)
+        target = undo.find_undo_target(events)
+        if target is None:
+            raise NothingToUndo(merge_id)
+
+        restored_pointers = json.loads(target["pointers"])
+        # Rebuild from the immutable snapshot, skipping the target batch.
+        # Replay raises AuditReplayError on an inconsistent history; that
+        # propagates and rolls the transaction back, so no state changes.
+        document, open_conflicts = undo.rebuild_state(
+            row, events, skip_seq=target["seq"]
+        )
+
+        conn.execute(
+            """
+            UPDATE merges
+            SET revision = revision + 1, document = ?,
+                conflicts = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(document),
+                json.dumps(open_conflicts),
+                _now(),
+                merge_id,
+            ),
+        )
+        # The undo itself is a chained event. It does not change status
+        # (a resolved merge cannot be undone) and records exactly which
+        # event it compensates, so a subsequent undo skips both.
+        audit.record_event(
+            conn,
+            merge_id,
+            audit.METHOD_RESOLUTION_UNDO,
+            row["revision"],
+            row["revision"] + 1,
+            restored_pointers,
+            {
+                undo.DETAIL_UNDONE_SEQ: target["seq"],
+                undo.DETAIL_RESTORED_POINTERS: restored_pointers,
+                "undone_method": target["method"],
+            },
+        )
+
+    view = get_merge(merge_id)
+    view["undone_seq"] = target["seq"]
+    view["undone_method"] = target["method"]
+    view["restored_pointers"] = restored_pointers
+    view["restored_count"] = len(restored_pointers)
     return view

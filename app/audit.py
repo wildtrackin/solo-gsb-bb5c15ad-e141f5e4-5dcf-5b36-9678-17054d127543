@@ -1,12 +1,13 @@
 """Conflict adjudication audit trail with a per-merge SHA-256 hash chain.
 
 Every successful state-changing adjudication — an explicit ``resolutions``
-batch, a ``rule-resolutions`` run, a ``reuse-resolutions`` run or a draft
-``commit`` — appends exactly one event to the merge order's audit trail,
-inside the *same* SQLite transaction as the merge update itself, so the
-event and the state change it describes commit or roll back together.
-Failed requests (400/409/422) and no-op requests (a rule run or reuse run
-that matched nothing) change no state and therefore leave no event.
+batch, a ``rule-resolutions`` run, a ``reuse-resolutions`` run, a draft
+``commit`` or a ``resolution-undo`` — appends exactly one event to the
+merge order's audit trail, inside the *same* SQLite transaction as the
+merge update itself, so the event and the state change it describes commit
+or roll back together. Failed requests (400/409/422) and no-op requests (a
+rule run or reuse run that matched nothing, an undo with nothing to undo)
+change no state and therefore leave no event.
 
 Each event records the adjudication method, the revision before/after and
 the JSON Pointers that actually took effect, plus method-specific detail
@@ -38,8 +39,20 @@ METHOD_RESOLUTIONS = "resolutions"
 METHOD_RULE_RESOLUTIONS = "rule-resolutions"
 METHOD_REUSE_RESOLUTIONS = "reuse-resolutions"
 METHOD_DRAFT_COMMIT = "draft-commit"
+# An undo event compensates exactly one of the adjudication methods above;
+# it never compensates another undo.
+METHOD_RESOLUTION_UNDO = "resolution-undo"
 
 METHODS = (
+    METHOD_RESOLUTIONS,
+    METHOD_RULE_RESOLUTIONS,
+    METHOD_REUSE_RESOLUTIONS,
+    METHOD_DRAFT_COMMIT,
+    METHOD_RESOLUTION_UNDO,
+)
+
+# Adjudication methods whose batches can be replayed (and therefore undone).
+ADJUDICATION_METHODS = (
     METHOD_RESOLUTIONS,
     METHOD_RULE_RESOLUTIONS,
     METHOD_REUSE_RESOLUTIONS,
@@ -160,22 +173,17 @@ def _row_to_event(row, valid: bool) -> dict:
     }
 
 
-def get_audit_trail(merge_id: str) -> dict:
-    """Return the merge order's events in sequence plus the chain verdict.
+def _verify_rows(rows) -> tuple[int | None, dict[int, bool]]:
+    """Re-hash stored rows; return (first_invalid_seq, {seq: valid}).
 
-    Every stored event is re-hashed from its own fields and checked for
-    sequence continuity and prev-hash linkage against its predecessor (the
-    first event must chain from the genesis prev-hash). ``chain_valid`` is
-    true only when every event passes all checks; ``first_invalid_seq`` is
-    the sequence number of the first anomalous event, or ``None`` when the
-    whole chain verifies.
+    Shared by the trail endpoint and by operations (resolution undo) that
+    must only rely on a chain they can verify: every event is re-hashed
+    from its own fields and checked for sequence continuity and prev-hash
+    linkage against its predecessor (the first event must chain from the
+    genesis prev-hash).
     """
-    rows = db.query_all(
-        "SELECT * FROM merge_audit_events WHERE merge_id = ? ORDER BY seq ASC",
-        (merge_id,),
-    )
-    events: list[dict] = []
     first_invalid_seq: int | None = None
+    valid_by_seq: dict[int, bool] = {}
     expected_seq = 1
     prev_hash = GENESIS_PREV_HASH
     for row in rows:
@@ -195,13 +203,48 @@ def get_audit_trail(merge_id: str) -> dict:
             and row["prev_hash"] == prev_hash
             and compute_hash(payload) == row["hash"]
         )
+        valid_by_seq[row["seq"]] = valid
         if not valid and first_invalid_seq is None:
             first_invalid_seq = row["seq"]
-        events.append(_row_to_event(row, valid))
         # The chain walks the *stored* values, so one tampered event does
         # not mask the integrity of its untouched successors.
         expected_seq = row["seq"] + 1
         prev_hash = row["hash"]
+    return first_invalid_seq, valid_by_seq
+
+
+def verify_chain(conn, merge_id: str) -> bool:
+    """Verify the merge order's stored chain using the caller's connection.
+
+    Safe to call inside a ``db.transaction`` block (it runs on the given
+    connection rather than opening another one). Resolution undo rebuilds
+    state from the stored history, so it refuses to proceed when the chain
+    cannot be verified.
+    """
+    rows = conn.execute(
+        "SELECT * FROM merge_audit_events WHERE merge_id = ? ORDER BY seq ASC",
+        (merge_id,),
+    ).fetchall()
+    first_invalid_seq, _ = _verify_rows(rows)
+    return first_invalid_seq is None
+
+
+def get_audit_trail(merge_id: str) -> dict:
+    """Return the merge order's events in sequence plus the chain verdict.
+
+    Every stored event is re-hashed from its own fields and checked for
+    sequence continuity and prev-hash linkage against its predecessor (the
+    first event must chain from the genesis prev-hash). ``chain_valid`` is
+    true only when every event passes all checks; ``first_invalid_seq`` is
+    the sequence number of the first anomalous event, or ``None`` when the
+    whole chain verifies.
+    """
+    rows = db.query_all(
+        "SELECT * FROM merge_audit_events WHERE merge_id = ? ORDER BY seq ASC",
+        (merge_id,),
+    )
+    first_invalid_seq, valid_by_seq = _verify_rows(rows)
+    events = [_row_to_event(row, valid_by_seq[row["seq"]]) for row in rows]
     return {
         "merge_id": merge_id,
         "event_count": len(events),

@@ -11,6 +11,7 @@ from . import db, store
 from .models import (
     DraftUpdateRequest,
     MergeCreate,
+    ResolutionUndoRequest,
     ResolveRequest,
     ReuseResolutionsRequest,
     RuleResolveRequest,
@@ -131,6 +132,31 @@ async def rule_apply_failed_handler(request: Request, exc: store.RuleApplication
 @app.exception_handler(store.SourceMergeInvalid)
 async def source_merge_invalid_handler(request: Request, exc: store.SourceMergeInvalid):
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(store.NothingToUndo)
+async def nothing_to_undo_handler(request: Request, exc: store.NothingToUndo):
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "no effective adjudication to undo: the merge has no "
+            "resolution batch that is not already compensated"
+        },
+    )
+
+
+@app.exception_handler(store.AuditChainBroken)
+async def audit_chain_broken_handler(request: Request, exc: store.AuditChainBroken):
+    # Undo rebuilds state by replaying the audit history; a chain that does
+    # not verify makes that history untrustworthy, so the request fails
+    # closed: 500, full rollback, no state change and no undo event.
+    return JSONResponse(
+        status_code=500,
+        content={
+            "detail": "the merge's audit chain does not verify; undo refused. "
+            "Inspect GET /merges/{merge_id}/audit for the first invalid event"
+        },
+    )
 
 
 @app.exception_handler(InvalidResultSchema)
@@ -289,6 +315,25 @@ def reuse_resolutions(merge_id: str, body: ReuseResolutionsRequest):
     report every conflict and its per-item reason.
     """
     return store.reuse_resolutions(merge_id, body.revision, body.source_merge_id)
+
+
+@app.post("/merges/{merge_id}/resolution-undo")
+def undo_resolution(merge_id: str, body: ResolutionUndoRequest):
+    """Undo the last effective adjudication batch of a pending merge.
+
+    Only pending merges with at least one not-yet-compensated adjudication
+    event accept an undo. The document and open conflicts are not reverse
+    edited: they are rebuilt from the merge's immutable initial conflict
+    snapshot by replaying the audit events, skipping the most recent
+    effective one. That restores every pointer of the batch as an open
+    conflict and bumps the revision by one. The undo appends a chained
+    ``resolution-undo`` audit event naming the compensated event's sequence
+    number and the restored pointers; later undos skip compensated events.
+    A stale revision, a resolved (immutable) merge or nothing left to undo
+    yields 409; an unknown merge yields 404. Nothing is changed and no
+    event is left on any failure.
+    """
+    return store.undo_last_resolution(merge_id, body.revision)
 
 
 # ---------------------------------------------------------------------------

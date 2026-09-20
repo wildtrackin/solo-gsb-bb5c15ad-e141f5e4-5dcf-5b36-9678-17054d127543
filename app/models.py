@@ -88,3 +88,7 @@ class DraftUpdateRequest(BaseModel):
             "takes 'choice' or 'value', like a resolution batch"
         ),
     )
+
+
+class ResolutionUndoRequest(BaseModel):
+    revision: int = Field(..., description="Current merge revision (409 if stale)")
