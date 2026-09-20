@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS merge_audit_events (
     merge_id        TEXT NOT NULL REFERENCES merges (id),
     seq             INTEGER NOT NULL,
     method          TEXT NOT NULL CHECK (method IN (
-        'resolutions', 'rule-resolutions', 'reuse-resolutions', 'draft-commit'
+        'resolutions', 'rule-resolutions', 'reuse-resolutions',
+        'draft-commit', 'resolution-undo'
     )),
     revision_before INTEGER NOT NULL,
     revision_after  INTEGER NOT NULL,
@@ -62,6 +63,32 @@ CREATE TABLE IF NOT EXISTS merge_audit_events (
     created_at      TEXT NOT NULL,
     UNIQUE (merge_id, seq)
 );
+"""
+
+# CHECK constraint definition for fresh tables; the rebuild migration below
+# keeps the same body when an existing database file predates undo events.
+_AUDIT_METHOD_CHECK = (
+    "method IN ('resolutions', 'rule-resolutions', 'reuse-resolutions', "
+    "'draft-commit', 'resolution-undo')"
+)
+
+# DDL used when rebuilding an audit table whose old CHECK constraint does
+# not yet allow 'resolution-undo' events (SQLite cannot ALTER a CHECK).
+_AUDIT_TABLE_REBUILD_DDL = """
+CREATE TABLE merge_audit_events (
+    id              INTEGER PRIMARY KEY AUTOINCREMENT,
+    merge_id        TEXT NOT NULL REFERENCES merges (id),
+    seq             INTEGER NOT NULL,
+    method          TEXT NOT NULL CHECK (""" + _AUDIT_METHOD_CHECK + """),
+    revision_before INTEGER NOT NULL,
+    revision_after  INTEGER NOT NULL,
+    pointers        TEXT NOT NULL,
+    detail          TEXT NOT NULL,
+    prev_hash       TEXT NOT NULL,
+    hash            TEXT NOT NULL,
+    created_at      TEXT NOT NULL,
+    UNIQUE (merge_id, seq)
+)
 """
 
 
@@ -88,6 +115,40 @@ _MIGRATIONS = (
 )
 
 
+def _migrate_audit_method_check(conn: sqlite3.Connection) -> None:
+    """Rebuild the audit table when its CHECK omits 'resolution-undo'.
+
+    SQLite cannot ALTER an existing CHECK constraint, so database files
+    created before undo support existed get the classic rename/copy/drop/
+    rename rebuild. The hash chain rows (and their rowids) are copied byte
+    for byte; only the constraint changes.
+    """
+    ddl_row = conn.execute(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' "
+        "AND name = 'merge_audit_events'"
+    ).fetchone()
+    if ddl_row is not None and "resolution-undo" in ddl_row["sql"]:
+        return
+    conn.execute("PRAGMA foreign_keys=OFF")
+    conn.executescript(
+        """
+        ALTER TABLE merge_audit_events RENAME TO merge_audit_events_old;
+        """
+        + _AUDIT_TABLE_REBUILD_DDL.strip()
+        + """;
+        INSERT INTO merge_audit_events (
+            id, merge_id, seq, method, revision_before, revision_after,
+            pointers, detail, prev_hash, hash, created_at
+        )
+        SELECT id, merge_id, seq, method, revision_before, revision_after,
+               pointers, detail, prev_hash, hash, created_at
+        FROM merge_audit_events_old;
+        DROP TABLE merge_audit_events_old;
+        """
+    )
+    conn.execute("PRAGMA foreign_keys=ON")
+
+
 def init_schema() -> None:
     with _lock:
         conn = connect()
@@ -96,6 +157,7 @@ def init_schema() -> None:
         for statement, column in _MIGRATIONS:
             if column not in existing:
                 conn.execute(statement)
+        _migrate_audit_method_check(conn)
         conn.commit()
 
 

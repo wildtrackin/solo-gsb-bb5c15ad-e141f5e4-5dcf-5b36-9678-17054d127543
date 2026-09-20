@@ -11,10 +11,12 @@ from . import db, store
 from .models import (
     DraftUpdateRequest,
     MergeCreate,
+    ResolutionUndoRequest,
     ResolveRequest,
     ReuseResolutionsRequest,
     RuleResolveRequest,
 )
+from .undo import ReplayInconsistent
 from .validation import InvalidResultSchema, ResultValidationFailed
 
 
@@ -62,6 +64,27 @@ async def not_resolved_handler(request: Request, exc: store.MergeNotResolved):
     return JSONResponse(
         status_code=409,
         content={"detail": "merge is pending: no result patch is available yet"},
+    )
+
+
+@app.exception_handler(store.NothingToUndo)
+async def nothing_to_undo_handler(request: Request, exc: store.NothingToUndo):
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "no adjudication available to undo"},
+    )
+
+
+@app.exception_handler(ReplayInconsistent)
+async def replay_inconsistent_handler(request: Request, exc: ReplayInconsistent):
+    # The audit trail cannot rebuild the merge order's state (tampered or
+    # corrupt history); the whole undo rolled back and nothing was written.
+    return JSONResponse(
+        status_code=409,
+        content={
+            "detail": "audit replay is inconsistent with the stored state; "
+            "undo refused, no state was changed"
+        },
     )
 
 
@@ -206,13 +229,14 @@ def get_merge_audit(merge_id: str):
     """Adjudication audit trail of the merge order, in sequence order.
 
     Every successful resolutions / rule-resolutions / reuse-resolutions /
-    draft-commit request appended exactly one event inside the same
-    transaction as the merge update; failed requests and zero-match no-ops
-    left none. Each event records the method, the revision before/after
-    and the JSON Pointers that took effect, and is chained to its
-    predecessor via SHA-256 over canonical JSON. The response re-verifies
-    the whole chain and, when it is broken, names the first anomalous
-    sequence number. Unknown merge: 404.
+    draft-commit / resolution-undo request appended exactly one event
+    inside the same transaction as the merge update; failed requests and
+    zero-match no-ops left none. Each event records the method, the
+    revision before/after and the JSON Pointers that took effect (for an
+    undo, the pointers restored), and is chained to its predecessor via
+    SHA-256 over canonical JSON. The response re-verifies the whole chain
+    and, when it is broken, names the first anomalous sequence number.
+    Unknown merge: 404.
     """
     return store.get_audit_trail(merge_id)
 
@@ -251,6 +275,27 @@ def preview_resolution(merge_id: str, body: ResolveRequest):
     SHA-256 are included.
     """
     return store.preview_resolutions(merge_id, body.revision, _resolution_items(body))
+
+
+@app.post("/merges/{merge_id}/resolution-undo")
+def undo_resolution(merge_id: str, body: ResolutionUndoRequest):
+    """Undo the most recent still-effective adjudication batch.
+
+    Only a *pending* merge carrying the current revision can be undone, and
+    only when at least one live adjudication (a resolutions /
+    rule-resolutions / reuse-resolutions / draft-commit event not already
+    compensated by an earlier undo) exists. The merge state is not reverse-
+    edited: the working document and the open conflicts are rebuilt from the
+    immutable initial conflict snapshot by replaying the audit chain with
+    the chosen batch marked compensated, so every pointer of that batch
+    reopens with its original base/left/right candidates. The revision
+    still increments by one and a ``resolution-undo`` event (chained, with
+    the compensated event's seq and the restored pointers) is appended in
+    the same transaction; later undos skip already-compensated events. A
+    stale revision, a resolved merge or an undo with nothing to undo
+    returns 409; failures change no state and leave no event.
+    """
+    return store.undo_resolution(merge_id, body.revision)
 
 
 @app.post("/merges/{merge_id}/rule-resolutions")

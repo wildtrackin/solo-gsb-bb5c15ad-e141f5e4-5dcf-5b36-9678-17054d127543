@@ -7,9 +7,9 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import audit, db, rules
+from . import audit, db, rules, undo as undo_mod
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
-from .patch import generate_patch, sha256_hex
+from .patch import canonical_json, generate_patch, sha256_hex
 from .reuse import (
     build_reuse_plan,
     match_to_batch_item,
@@ -75,6 +75,10 @@ class DraftConflictSetChanged(Exception):
 
 class SourceMergeInvalid(Exception):
     """The source merge of a reuse request cannot provide resolutions."""
+
+
+class NothingToUndo(Exception):
+    """A pending merge has no live adjudication left to undo."""
 
 
 def _now() -> str:
@@ -846,4 +850,112 @@ def commit_draft(merge_id: str, draft_id: str) -> dict:
         )
     view = get_merge(merge_id)
     view["draft_id"] = draft_id
+    return view
+
+
+# ---------------------------------------------------------------------------
+# Resolution undo: compensate the most recent live adjudication batch by
+# rebuilding document and open conflicts from the immutable initial snapshot
+# plus audit replay — never by reverse-editing the current working JSON.
+# ---------------------------------------------------------------------------
+
+
+def undo_resolution(merge_id: str, expected_revision: int) -> dict:
+    """Undo the most recent still-effective adjudication batch.
+
+    Only a pending merge carrying the current revision can be undone. The
+    target event is the newest adjudication (resolutions / rule-resolutions
+    / reuse-resolutions / draft-commit) not already compensated by an
+    earlier ``resolution-undo``; undo events themselves are skipped. State
+    is rebuilt entirely from the immutable initial conflict snapshot and
+    audit replay, then written in a single UPDATE with one revision bump;
+    the compensating audit event (carrying the undone event's seq and the
+    restored pointers) is appended in the same transaction.
+
+    Raises StaleRevision / AlreadyResolved (409), NothingToUndo (409 when
+    no live adjudication remains) or MergeNotFound (404). Every failure
+    rolls back: no state change and no audit event.
+    """
+    with db.transaction() as conn:
+        row = conn.execute(
+            "SELECT * FROM merges WHERE id = ?", (merge_id,)
+        ).fetchone()
+        if row is None:
+            raise MergeNotFound(merge_id)
+        if row["status"] == STATUS_RESOLVED:
+            # The resolved result is immutable: undo cannot reopen it.
+            raise AlreadyResolved(merge_id)
+        if row["revision"] != expected_revision:
+            raise StaleRevision(row["revision"])
+
+        events = undo_mod.load_events(conn, merge_id)
+        compensated = undo_mod.compensated_seqs(events)
+        target = undo_mod.latest_live_adjudication(events, compensated)
+        if target is None:
+            raise NothingToUndo(merge_id)
+
+        new_skip = compensated | {target.seq}
+        # Replay both ways: the current state must match the stored document
+        # and conflict set, proving the audit chain faithfully reconstructs
+        # what is persisted before any compensation is written.
+        current_doc, current_conflicts = undo_mod.rebuild_state(
+            row, events, compensated
+        )
+        if canonical_json(current_doc) != canonical_json(
+            json.loads(row["document"])
+        ) or {c["pointer"] for c in current_conflicts} != {
+            c["pointer"] for c in json.loads(row["conflicts"])
+        }:
+            raise undo_mod.ReplayInconsistent(
+                "audit replay does not reproduce the current state"
+            )
+
+        document, reopened_conflicts = undo_mod.rebuild_state(
+            row, events, new_skip
+        )
+        restored_pointers = list(target.pointers)
+        # Defensive: compensation must reopen exactly the pointers the
+        # target event closed and nothing else.
+        if {c["pointer"] for c in reopened_conflicts} != {
+            c["pointer"] for c in current_conflicts
+        } | set(restored_pointers):
+            raise undo_mod.ReplayInconsistent(
+                "undo replay did not restore exactly the target pointers"
+            )
+
+        now = _now()
+        conn.execute(
+            """
+            UPDATE merges
+            SET revision = revision + 1, document = ?, conflicts = ?,
+                result = NULL, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                json.dumps(document),
+                json.dumps(reopened_conflicts),
+                now,
+                merge_id,
+            ),
+        )
+        # The undo is itself an ordinary chain link; its detail names the
+        # compensated event and the pointers it restored, so later undos
+        # skip the compensated event while the chain stays verifiable.
+        audit.record_event(
+            conn,
+            merge_id,
+            audit.METHOD_RESOLUTION_UNDO,
+            row["revision"],
+            row["revision"] + 1,
+            restored_pointers,
+            {
+                "undone_seq": target.seq,
+                "undone_method": target.method,
+                "restored_pointers": restored_pointers,
+            },
+        )
+    view = get_merge(merge_id)
+    view["undone_seq"] = target.seq
+    view["undone_method"] = target.method
+    view["restored_pointers"] = restored_pointers
     return view

@@ -1,17 +1,19 @@
 """Conflict adjudication audit trail with a per-merge SHA-256 hash chain.
 
 Every successful state-changing adjudication — an explicit ``resolutions``
-batch, a ``rule-resolutions`` run, a ``reuse-resolutions`` run or a draft
-``commit`` — appends exactly one event to the merge order's audit trail,
-inside the *same* SQLite transaction as the merge update itself, so the
-event and the state change it describes commit or roll back together.
-Failed requests (400/409/422) and no-op requests (a rule run or reuse run
-that matched nothing) change no state and therefore leave no event.
+batch, a ``rule-resolutions`` run, a ``reuse-resolutions`` run, a draft
+``commit`` or a ``resolution-undo`` — appends exactly one event to the
+merge order's audit trail, inside the *same* SQLite transaction as the
+merge update itself, so the event and the state change it describes commit
+or roll back together. Failed requests (400/409/422) and no-op requests (a
+rule run or reuse run that matched nothing, an undo with nothing left to
+undo) change no state and therefore leave no event.
 
 Each event records the adjudication method, the revision before/after and
-the JSON Pointers that actually took effect, plus method-specific detail
-(the per-pointer decision, the reuse source, the committed draft). Events
-form a hash chain per merge order: ``hash`` is the SHA-256 of the event's
+the JSON Pointers that actually took effect (for an undo, the pointers
+reopened), plus method-specific detail (the per-pointer decision, the reuse
+source, the committed draft, or the compensated event's seq). Events form a
+hash chain per merge order: ``hash`` is the SHA-256 of the event's
 canonical JSON (sorted keys, no whitespace — the same serialization used
 for document digests), and the payload includes the previous event's
 ``hash``, so altering or deleting a recorded event breaks the chain at a
@@ -38,12 +40,19 @@ METHOD_RESOLUTIONS = "resolutions"
 METHOD_RULE_RESOLUTIONS = "rule-resolutions"
 METHOD_REUSE_RESOLUTIONS = "reuse-resolutions"
 METHOD_DRAFT_COMMIT = "draft-commit"
+# An undo event compensates exactly one earlier adjudication event: the
+# compensated event's seq is carried in ``detail.undone_seq`` and is skipped
+# when later undos search for the next event to undo. Undo events are
+# ordinary links in the chain (same hashing/verification rules) and never
+# undone themselves — re-undoing skips past them to the next live verdict.
+METHOD_RESOLUTION_UNDO = "resolution-undo"
 
 METHODS = (
     METHOD_RESOLUTIONS,
     METHOD_RULE_RESOLUTIONS,
     METHOD_REUSE_RESOLUTIONS,
     METHOD_DRAFT_COMMIT,
+    METHOD_RESOLUTION_UNDO,
 )
 
 # Prev-hash carried by the first event of every merge order's chain.

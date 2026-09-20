@@ -46,6 +46,16 @@ class ResolveRequest(BaseModel):
     )
 
 
+class ResolutionUndoRequest(BaseModel):
+    revision: int = Field(
+        ...,
+        description=(
+            "Current merge revision (409 if stale). The undo bumps the "
+            "revision by one even though it reopens an earlier batch."
+        ),
+    )
+
+
 class RuleItem(BaseModel):
     left: str | None = Field(
         default=None,
